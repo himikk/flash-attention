@@ -2528,21 +2528,11 @@ class FlashAttentionMLAForwardSm100:
         cute.arch.fence_view_async_tmem_load()
         pipeline_S.consumer_release(consumer_state_S)
 
-        rBitmask = None
-        if const_expr(self.is_topk_gather and not self.disable_bitmask):
-            assert pipeline_bitmask is not None
-            assert consumer_state_bitmask is not None
-            pipeline_bitmask.consumer_wait(consumer_state_bitmask)
-            rBitmask = cute.make_rmem_tensor((self.tile_n // 64,), dtype=Uint32)
-            bitmask_col_offset = self.tile_n // 64 if warp_idx >= 2 else 0
-            for i in cutlass.range_constexpr(cute.size(rBitmask)):
-                rBitmask[i] = sBitmask[bitmask_col_offset + i, consumer_state_bitmask.index]
-
         if const_expr(mask_fn is not None):
-            mask_fn(tSrS_t2r, n_block=n_block, rBitmask=rBitmask)
+            mask_fn(tSrS_t2r, n_block=n_block)
 
         # compute threadwise row_max
-        row_max = softmax.compute_row_max_local(tSrS_t2r.load(), is_first)
+        row_max = softmax._compute_row_max(tSrS_t2r.load())
         self.softmax_barrier.arrive_and_wait()
 
         # 2-thread reduce row_max through smem
@@ -2556,7 +2546,7 @@ class FlashAttentionMLAForwardSm100:
         row_max1 = sRowMax[tidx % self.cta_tile_m, 1]
         row_max = max(row_max0, row_max1)
 
-        row_max, acc_scale = softmax.update_row_max_from_local(row_max, is_first)
+        row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         # note: acc_scales agree for paired threads
         pipeline_sm_stats.producer_acquire(producer_state_sm_stats)

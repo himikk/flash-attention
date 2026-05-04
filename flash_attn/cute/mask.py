@@ -386,6 +386,7 @@ class AttentionMask:
         head_divmod=None,
         check_q_boundary: bool = False,
         r2p: cutlass.Constexpr[bool] = True,
+        rBitmask: Optional[cute.Tensor] = None,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_shape = (self.tile_m, self.tile_n)

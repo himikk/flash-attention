@@ -185,7 +185,6 @@ def test_flash_attn_head_dim_256_backward(
 from flash_attn.cute.interface import _flash_attn_fwd as _flash_attn_fwd_internal
 
 
-@pytest.mark.xfail(reason="MLA kernel compilation issue: r2p parameter not supported in current mask.py")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [True])  # Only test causal=True as non-causal also fails
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
