@@ -385,6 +385,7 @@ class AttentionMask:
         fastdiv_mods=(None, None),
         head_divmod=None,
         check_q_boundary: bool = False,
+        r2p: cutlass.Constexpr[bool] = True,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_shape = (self.tile_m, self.tile_n)
@@ -398,7 +399,6 @@ class AttentionMask:
         if n_block < 0:
             n_block = 0
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n
-        r2p = True
         if const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
                 if const_expr(not r2p):
