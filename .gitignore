@@ -6,6 +6,7 @@
 .DS_store
 .vscode
 worktrees/
+.sisyphus/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
