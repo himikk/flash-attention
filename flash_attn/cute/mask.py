@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
+import enum
 from typing import Optional, Callable, TypeAlias
 from dataclasses import dataclass
 
@@ -709,3 +710,117 @@ class AttentionMask:
                         mask_gen_fn,
                         rank1=True,
                     )
+
+
+# SM100-specific mask classes for head_dim=256 support
+class Sm100MaskEnum(enum.Enum):
+    """Enumeration of mask types for FMHA operations."""
+
+    NO_MASK = enum.auto()
+    RESIDUAL_MASK = enum.auto()
+    CAUSAL_MASK = enum.auto()
+    WINDOW_MASK = enum.auto()
+    WINDOW_MASK_INFERENCE = enum.auto()
+    WINDOW_MASK_BWD = enum.auto()
+    WINDOW_MASK_BWD_INFERENCE = enum.auto()
+    RESIDUAL_MASK_BWD = enum.auto()
+
+
+class Sm100FusedMask:
+    """A fused mask implementation for FMHA operations."""
+
+    def get_trip_count(
+        mask_type,
+        blk_coord: cute.Coord,
+        tile_shape: cute.Shape,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        window_size_left: Optional[Int32] = None,
+        window_size_right: Optional[Int32] = None,
+    ) -> Int32:
+        result = 0
+        offset = 0
+        if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE):
+            offset = seqlen_k - seqlen_q
+        if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE):
+            offset = seqlen_q - seqlen_k
+        if cutlass.const_expr(mask_type == Sm100MaskEnum.RESIDUAL_MASK):
+            result = cute.ceil_div(seqlen_k, tile_shape[1])
+        if cutlass.const_expr(mask_type is Sm100MaskEnum.RESIDUAL_MASK_BWD):
+            result = cute.ceil_div(seqlen_q, tile_shape[0])
+        if cutlass.const_expr(
+            mask_type == Sm100MaskEnum.WINDOW_MASK
+            or mask_type == Sm100MaskEnum.WINDOW_MASK_INFERENCE
+        ):
+            if cutlass.const_expr(window_size_right is None):
+                result = cute.ceil_div(seqlen_k, tile_shape[1])
+            else:
+                max_idx_q = (blk_coord[0] + 1) * tile_shape[0]
+                idx_k = max_idx_q + offset + window_size_right
+                tmp_blocks_k = cute.ceil_div(idx_k, tile_shape[1])
+                max_blocks_k = cute.ceil_div(seqlen_k, tile_shape[1])
+                result = dsl_min(max_blocks_k, tmp_blocks_k)
+        if cutlass.const_expr(
+            mask_type == Sm100MaskEnum.WINDOW_MASK_BWD
+            or mask_type == Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE
+        ):
+            if cutlass.const_expr(window_size_left is None):
+                result = cute.ceil_div(seqlen_q, tile_shape[0])
+            else:
+                max_idx_k = (blk_coord[1] + 1) * tile_shape[1]
+                idx_q = max_idx_k + offset - window_size_right
+                tmp_blocks_q = cute.ceil_div(idx_q, tile_shape[0])
+                max_blocks_q = cute.ceil_div(seqlen_q, tile_shape[0])
+                result = dsl_min(max_blocks_q, tmp_blocks_q)
+        start_block = Sm100FusedMask.get_trip_start(
+            mask_type,
+            blk_coord,
+            tile_shape,
+            seqlen_q,
+            seqlen_k,
+            window_size_left,
+            window_size_right,
+        )
+        result = result - start_block
+        return result
+
+    @cute.jit
+    def get_trip_start(
+        mask_type,
+        blk_coord: cute.Coord,
+        tile_shape: cute.Shape,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        window_size_left: Optional[Int32] = None,
+        window_size_right: Optional[Int32] = None,
+    ) -> Int32:
+        result = 0
+        offset = 0
+        if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE):
+            offset = seqlen_k - seqlen_q
+        if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE):
+            offset = seqlen_q - seqlen_k
+        if cutlass.const_expr(
+            mask_type is Sm100MaskEnum.WINDOW_MASK
+            or mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE
+        ):
+            if cutlass.const_expr(window_size_left is not None):
+                min_idx_q = blk_coord[0] * tile_shape[0]
+                idx_k = min_idx_q + offset - window_size_left
+                tmp_blocks_k = idx_k // tile_shape[1]
+                result = max(tmp_blocks_k, result)
+        if cutlass.const_expr(
+            mask_type is Sm100MaskEnum.WINDOW_MASK_BWD
+            or mask_type is Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE
+        ):
+            if cutlass.const_expr(window_size_right is not None):
+                min_idx_k = blk_coord[1] * tile_shape[1]
+                idx_q = min_idx_k + offset - window_size_right
+                tmp_blocks_q = idx_q // tile_shape[0]
+                result = max(tmp_blocks_q, result)
+        return result
+
+
+def dsl_min(a, b):
+    """Helper function for minimum value."""
+    return a if a < b else b

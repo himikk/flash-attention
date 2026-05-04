@@ -162,13 +162,13 @@ class FlashAttentionBackwardSm80:
         else:
             if cutlass.const_expr(not (mdK_type == mdV_type == cutlass.Float32)):
                 raise TypeError("mdKaccum and mdVaccum tensors must have the data type Float32")
-        if cutlass.const_expr(not mQ_type in [cutlass.Float16, cutlass.BFloat16]):
+        if cutlass.const_expr(mQ_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise TypeError("Only Float16 or BFloat16 is supported")
-        if cutlass.const_expr(not mLSE_type in [cutlass.Float32]):
+        if cutlass.const_expr(mLSE_type not in [cutlass.Float32]):
             raise TypeError("LSE tensor must be Float32")
-        if cutlass.const_expr(not mdPsum_type in [cutlass.Float32]):
+        if cutlass.const_expr(mdPsum_type not in [cutlass.Float32]):
             raise TypeError("dPsum tensor must be Float32")
-        if cutlass.const_expr(not mdQaccum_type in [cutlass.Float32]):
+        if cutlass.const_expr(mdQaccum_type not in [cutlass.Float32]):
             raise TypeError("dQaccum tensor must be Float32")
         if cutlass.const_expr(mCuSeqlensQ_type not in [None, cutlass.Int32]):
             raise TypeError("cuSeqlensQ tensor must be Int32")

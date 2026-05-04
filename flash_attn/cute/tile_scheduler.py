@@ -16,6 +16,7 @@ import cutlass.cute as cute
 from cutlass import Int32, const_expr
 from cutlass.cute import FastDivmodDivisor
 from cutlass.utils import ClcDynamicPersistentTileScheduler, ClcDynamicPersistentTileSchedulerParams
+from cutlass.utils import HardwareInfo
 
 from quack.cute_dsl_utils import ParamsBase
 
@@ -1085,3 +1086,427 @@ class SingleTileVarlenScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return self.__class__(*obj_list, loc=self._loc)
+
+
+def dsl_min(a, b):
+    """Helper function for minimum value."""
+    return a if a < b else b
+
+
+# FMHA-specific helpers for SM100 (extracted from head_dim_256 branch)
+def compute_sm100_fmha_grid(
+    o_shape: cute.Shape,
+    cta_tiler: Tuple[int, int, int],
+    is_persistent: bool,
+) -> Tuple['Sm100FmhaStaticTileSchedulerParams', Tuple[int, int, int]]:
+    """Compute grid parameters for FMHA (static scheduler).
+
+    The output tensor o has shape (s, d, ((h_r, h_k), b)).
+    """
+    tile_sched_params = Sm100FmhaStaticTileSchedulerParams(
+        is_persistent,
+        (
+            cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]),
+            cute.size(o_shape[2][0]),
+            cute.size(o_shape[2][1]),
+        ),
+    )
+    grid = Sm100FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
+    return tile_sched_params, grid
+
+
+##############################################################################
+# Fmha CLC dynamic tile scheduler
+##############################################################################
+
+
+class Sm100FmhaClcDynamicTileSchedulerParams:
+    """Parameters for FMHA CLC dynamic persistent tile scheduler.
+
+    This class manages the layout of tiles for CLC (Cluster Launch Control)
+    based dynamic scheduling, adapted for FMHA's (M, B, H) problem shape.
+
+    :ivar problem_shape_mbh: Problem shape in (M, B, H) format.
+    :type problem_shape_mbh: cute.Shape
+    :ivar cluster_shape_mnk: Cluster shape in (M, N, K) format.
+    :type cluster_shape_mnk: cute.Shape
+    """
+
+    def __init__(
+        self,
+        problem_shape_mbh: cute.Shape,
+        cluster_shape_mnk: cute.Shape,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        self.problem_shape_mbh = problem_shape_mbh
+        self._cluster_shape_mnk = cluster_shape_mnk
+        self.cluster_shape_mn = cluster_shape_mnk[:2]
+        self._loc = loc
+        self._ip = ip
+
+        # FMHA uses linear indexing over (M, B, H), convert to (M, N, L) style
+        # For FMHA: M dim is tile count along sequence, N=1, L=(B*H)
+        self.problem_shape_ntile_mnl = (
+            problem_shape_mbh[0],  # M tiles
+            1,  # N tiles (always 1 for FMHA)
+            problem_shape_mbh[1] * problem_shape_mbh[2],  # L = B * H
+        )
+
+        # Create layout for cluster-to-tile mapping
+        self.problem_layout_ncluster_mnl = cute.make_layout(
+            cute.ceil_div(self.problem_shape_ntile_mnl, cluster_shape_mnk[:2]),
+            loc=loc,
+            ip=ip,
+        )
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [
+            self.problem_shape_mbh,
+            self._cluster_shape_mnk,
+        ]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        values_copy = list(values)
+        for obj, n_items in zip(
+            [self.problem_shape_mbh, self._cluster_shape_mnk],
+            self._values_pos,
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values_copy[:n_items]))
+            values_copy = values_copy[n_items:]
+        return Sm100FmhaClcDynamicTileSchedulerParams(*(tuple(obj_list)), loc=self._loc)
+
+    def get_grid_shape(self, *, loc=None, ip=None) -> Tuple[int, int, int]:
+        """Compute grid shape aligned with cluster shape."""
+        return cute.round_up(self.problem_shape_ntile_mnl, self._cluster_shape_mnk)
+
+    def clc_hw_params(self) -> ClcDynamicPersistentTileSchedulerParams:
+        """Return params for the upstream CLC hardware scheduler."""
+        return ClcDynamicPersistentTileSchedulerParams(
+            problem_shape_ntile_mnl=self.problem_shape_ntile_mnl,
+            cluster_shape_mnk=self._cluster_shape_mnk,
+        )
+
+
+class Sm100FmhaClcDynamicTileScheduler:
+    """CLC dynamic persistent tile scheduler for FMHA.
+
+    This scheduler uses Blackwell's Cluster Launch Control hardware mechanism
+    for dynamic tile distribution, providing automatic load balancing.
+    Adapted for FMHA's (M, B, H) problem shape.
+    """
+
+    def __init__(
+        self,
+        params: Sm100FmhaClcDynamicTileSchedulerParams,
+        cta_id_in_cluster: cute.Coord,
+        num_tiles_executed: Int32,
+        clc_response_ptr: cute.Pointer,
+        block_idx: Tuple,
+        clc: ClcState = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        self.params = params
+        self.cta_id_in_cluster = cta_id_in_cluster
+        self._num_tiles_executed = num_tiles_executed
+        self._clc_response_ptr = clc_response_ptr
+        self._block_idx = block_idx
+        self.clc = clc
+        self._loc = loc
+        self._ip = ip
+
+    def __extract_mlir_values__(self):
+        values = cutlass.extract_mlir_values(self.cta_id_in_cluster)
+        values.extend(cutlass.extract_mlir_values(self._num_tiles_executed))
+        values.extend(cutlass.extract_mlir_values(self._clc_response_ptr))
+        values.extend(cutlass.extract_mlir_values(self._block_idx))
+        if self.clc is not None:
+            values.extend(cutlass.extract_mlir_values(self.clc))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        new_cta_id_in_cluster = cutlass.new_from_mlir_values(self.cta_id_in_cluster, values[0:3])
+        new_num_tiles_executed = cutlass.new_from_mlir_values(self._num_tiles_executed, [values[3]])
+        new_clc_response_ptr = cutlass.new_from_mlir_values(self._clc_response_ptr, [values[4]])
+        new_block_idx = cutlass.new_from_mlir_values(self._block_idx, values[5:8])
+        new_clc = None
+        if self.clc is not None:
+            new_clc = cutlass.new_from_mlir_values(self.clc, values[8:])
+        return Sm100FmhaClcDynamicTileScheduler(
+            self.params,
+            new_cta_id_in_cluster,
+            new_num_tiles_executed,
+            new_clc_response_ptr,
+            new_block_idx,
+            new_clc,
+        )
+
+    @staticmethod
+    def create(
+        params: Sm100FmhaClcDynamicTileSchedulerParams,
+        block_idx: Tuple,
+        grid_dim: Tuple,
+        clc_response_ptr: cute.Pointer,
+        clc: ClcState = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        """Create a CLC dynamic tile scheduler instance."""
+        bidx, bidy, bidz = block_idx
+
+        # CTA id in cluster
+        cta_id_in_cluster = (
+            Int32(bidx % params.cluster_shape_mn[0]),
+            Int32(bidy % params.cluster_shape_mn[1]),
+            Int32(0),
+        )
+
+        num_tiles_executed = Int32(0)
+
+        return Sm100FmhaClcDynamicTileScheduler(
+            params,
+            cta_id_in_cluster,
+            num_tiles_executed,
+            clc_response_ptr,
+            block_idx,
+            clc,
+        )
+
+    @staticmethod
+    def get_grid_shape(
+        params: Sm100FmhaClcDynamicTileSchedulerParams,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[int, int, int]:
+        """Get grid shape for kernel launch."""
+        return params.get_grid_shape(loc=loc, ip=ip)
+
+    def work_tile_info_from_clc_response(self, result_addr: cute.Pointer, *, loc=None, ip=None):
+        """Parse CLC response and convert to FMHA tile coordinates."""
+        m_idx, n_idx, l_idx, vld = cute.arch.clc_response(result_addr, loc=loc, ip=ip)
+        cute.arch.fence_proxy("async.shared", space="cta")
+
+        # CLC returns first CTA coordinates: m_idx=x, l_idx=z
+        # l_idx is the L (batch) dimension; decode to (bid, hid)
+        hid = l_idx % self.params.problem_shape_mbh[2]
+        bid = l_idx // self.params.problem_shape_mbh[2]
+
+        cta_idx_in_cluster, cta_idy_in_cluster, _ = self.cta_id_in_cluster
+        cur_tile_coord = (
+            m_idx + cta_idx_in_cluster,  # M dimension
+            0,  # N always 0 for FMHA
+            (bid, hid),  # (B, H) packed
+        )
+
+        return cutlass.utils.WorkTileInfo(cur_tile_coord, vld)
+
+    def get_current_work(self, *, loc=None, ip=None):
+        """Get current work tile from CLC response."""
+        return self.work_tile_info_from_clc_response(self._clc_response_ptr, loc=loc, ip=ip)
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        """Get initial work tile based on block index."""
+        bidx, bidy, bidz = self._block_idx
+        # bidz is the L (batch) dimension; decode to (bid, hid)
+        hid = bidz % self.params.problem_shape_mbh[2]
+        bid = bidz // self.params.problem_shape_mbh[2]
+        return cutlass.utils.WorkTileInfo((bidx, 0, (bid, hid)), True)
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        """Consumer-side advance: wait for next tile, read coordinates, release."""
+        self.clc.consumer_wait(loc=loc, ip=ip)
+        work = self.get_current_work(loc=loc, ip=ip)
+        self.clc.consumer_release(loc=loc, ip=ip)
+        self._num_tiles_executed += Int32(1)
+        return work
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        """Producer-side: issue CLC query for next tile."""
+        self.clc.prefetch_next_work(loc=loc, ip=ip)
+
+    def producer_tail(self, *, loc=None, ip=None):
+        """Producer-side cleanup after last tile."""
+        self.clc.producer_tail(loc=loc, ip=ip)
+
+    @property
+    def num_tiles_executed(self) -> Int32:
+        return self._num_tiles_executed
+
+
+def compute_sm100_fmha_grid_clc(
+    o_shape: cute.Shape,
+    cta_tiler: Tuple[int, int, int],
+    cluster_shape_mnk: Tuple[int, int, int],
+) -> Tuple[Sm100FmhaClcDynamicTileSchedulerParams, Tuple[int, int, int]]:
+    """Compute grid parameters for FMHA with CLC dynamic scheduling."""
+    problem_shape_mbh = (
+        cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]),
+        cute.size(o_shape[2][0]),
+        cute.size(o_shape[2][1]),
+    )
+    tile_sched_params = Sm100FmhaClcDynamicTileSchedulerParams(problem_shape_mbh, cluster_shape_mnk)
+    grid = Sm100FmhaClcDynamicTileScheduler.get_grid_shape(tile_sched_params)
+    return tile_sched_params, grid
+
+
+##############################################################################
+# Fused Mask
+##############################################################################
+
+
+def make_sm100_thread_cooperative_group(size: int):
+    return cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, size)
+
+
+SM100_TMEM_CAPACITY_COLUMNS = 512
+
+
+##############################################################################
+# FMHA static tile scheduler (for head_dim=256 support)
+##############################################################################
+
+
+class Sm100FmhaStaticTileSchedulerParams:
+    """A class to represent parameters for the FMHA (Fused Multi-Head Attention) static tile scheduler."""
+
+    def __init__(
+        self,
+        is_persistent: bool,
+        problem_shape_mbh: cute.Shape,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        self.is_persistent = is_persistent
+        self.problem_shape_mbh = problem_shape_mbh
+        self._loc = loc
+        self._ip = ip
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.problem_shape_mbh]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip([self.problem_shape_mbh], self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return Sm100FmhaStaticTileSchedulerParams(
+            self.is_persistent, *(tuple(obj_list)), loc=self._loc
+        )
+
+
+class Sm100FmhaStaticTileScheduler:
+    """A static tile scheduler for FMHA operations."""
+
+    def __init__(
+        self,
+        params: Sm100FmhaStaticTileSchedulerParams,
+        current_work_linear_idx: Int32,
+        blk_coord: cute.Coord,
+        grid_shape: cute.Shape,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        self._params = params
+        self._blk_coord = blk_coord
+        self._grid_shape = grid_shape
+        self._is_persistent = params.is_persistent
+        self._current_work_linear_idx = current_work_linear_idx
+        self._problem_shape_mbh = cute.make_layout(params.problem_shape_mbh, loc=loc, ip=ip)
+        self._num_blocks = cute.size(self._problem_shape_mbh, loc=loc, ip=ip)
+        self._is_first_block = True
+        self.num_persistent_sm = cute.size(grid_shape, loc=loc, ip=ip)
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def get_grid_shape(
+        params: Sm100FmhaStaticTileSchedulerParams,
+        *,
+        loc=None,
+        ip=None,
+    ) -> cute.Shape:
+        if params.is_persistent:
+            hardware_info = HardwareInfo()
+            sm_count = hardware_info.get_device_multiprocessor_count()
+            return (
+                dsl_min(sm_count, cute.size(params.problem_shape_mbh, loc=loc, ip=ip)),
+                1,
+                1,
+            )
+        else:
+            return params.problem_shape_mbh
+
+    def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
+        is_valid = (
+            self._current_work_linear_idx < self._num_blocks
+            if self._is_persistent
+            else self._is_first_block
+        )
+
+        blk_coord = (0, 0, 0)
+        if self._is_persistent:
+            blk_coord = self._problem_shape_mbh.get_hier_coord(
+                self._current_work_linear_idx, loc=loc, ip=ip
+            )
+        else:
+            blk_coord = self._blk_coord
+
+        cur_tile_coord = (
+            blk_coord[0],
+            0,
+            (blk_coord[1], blk_coord[2]),
+        )
+
+        return cutlass.utils.WorkTileInfo(cur_tile_coord, is_valid)
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def advance_to_next_work(self, *, advance_count=1, loc=None, ip=None):
+        if self._is_persistent:
+            self._current_work_linear_idx += advance_count * self.num_persistent_sm
+        self._is_first_block = False
+        return self.get_current_work()
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def producer_tail(self, *, loc=None, ip=None):
+        pass
+
+    def __extract_mlir_values__(self):
+        values = cutlass.extract_mlir_values(self._params)
+        values.extend(cutlass.extract_mlir_values(self._current_work_linear_idx))
+        values.extend(cutlass.extract_mlir_values(self._blk_coord))
+        values.extend(cutlass.extract_mlir_values(self._grid_shape))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        assert len(values) == 10
+        new_params = cutlass.new_from_mlir_values(self._params, values[0:3])
+        new_current_work_linear_idx = cutlass.new_from_mlir_values(
+            self._current_work_linear_idx, [values[3]]
+        )
+        new_blk_coord = cutlass.new_from_mlir_values(self._blk_coord, values[4:7])
+        new_grid_shape = cutlass.new_from_mlir_values(self._grid_shape, values[7:])
+        return Sm100FmhaStaticTileScheduler(
+            new_params, new_current_work_linear_idx, new_blk_coord, new_grid_shape
+        )
