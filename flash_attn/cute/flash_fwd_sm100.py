@@ -14,7 +14,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
-from typing import Tuple, Callable, Optional, Literal
+from typing import Tuple, Callable, Optional, Literal, NamedTuple
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -88,6 +88,15 @@ _TUNING_CONFIG = {
     (False, True, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 72},
 }
 # === END TUNING KNOBS ===
+
+
+class DescaleTensors(NamedTuple):
+    q_descale: Optional[cute.Tensor] = None
+    k_descale: Optional[cute.Tensor] = None
+    v_descale: Optional[cute.Tensor] = None
+
+    def __new_from_mlir_values__(self, values):
+        return DescaleTensors(*((*values, None, None, None)[:3]))
 
 
 class FlashAttentionForwardSm100:
