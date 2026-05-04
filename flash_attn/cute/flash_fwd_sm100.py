@@ -2,21 +2,17 @@
 # - BF16 & FP16 dtype
 # - noncausal & causal attention
 # - MHA, GQA, MQA
-# - hdim 64, 96, 128, (192, 128).
+# - hdim 64, 96, 128, (192, 128), 256
 # - varlen
 # - sliding window
 # - split-kv
-# Unsupported features that will be added later:
-# - page size != 128
-# - more hdim (192, 256)
 # Based on the cutlass example and cute-dsl example:
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
-from typing import Tuple, Callable, Optional, Literal
+from typing import Tuple, Callable, Optional, Literal, NamedTuple
 from functools import partial
-
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -1524,8 +1520,8 @@ class FlashAttentionForwardSm100:
                 # idesc=qk_mma_idesc,
                 smem_desc_base_b=k_smem_base,
                 tCrB_layout=tSrK[None, None, None, 0].layout,
-                smem_var_name_prefix=f"fa_fwd_q_smem_desc",
-                idesc_var_name=f"fa_fwd_qk_mma_idesc",
+                smem_var_name_prefix="fa_fwd_q_smem_desc",
+                idesc_var_name="fa_fwd_qk_mma_idesc",
                 smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
                 zero_init=True,
                 cta_group=self.cta_group_size,
@@ -2993,3 +2989,13 @@ class FlashAttentionForwardSm100:
             constant_q_idx=q_idx_logical,
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
         )
+
+
+# FP8 descaling helper for head_dim=256 support
+class DescaleTensors(NamedTuple):
+    q_descale: Optional[cute.Tensor] = None
+    k_descale: Optional[cute.Tensor] = None
+    v_descale: Optional[cute.Tensor] = None
+
+    def __new_from_mlir_values__(self, values):
+        return DescaleTensors(*((*values, None, None, None)[:3]))
